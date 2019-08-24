@@ -1,0 +1,118 @@
+#!/usr/bin/python3
+#	htmltex - Render LaTeX images into HTML documents
+#	Copyright (C) 2011-2019 Johannes Bauer
+#
+#	This file is part of htmltex.
+#
+#	htmltex is free software; you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation; this program is ONLY licensed under
+#	version 3 of the License, later versions are explicitly excluded.
+#
+#	htmltex is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#	GNU General Public License for more details.
+#
+#	You should have received a copy of the GNU General Public License
+#	along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#	Johannes Bauer <JohannesBauer@gmx.de>
+
+import re
+import sys
+import hashlib
+import tempfile
+import os
+import subprocess
+import contextlib
+from FriendlyArgumentParser import FriendlyArgumentParser
+
+parser = FriendlyArgumentParser(description = "Render .")
+parser.add_argument("-r", "--resolution", metavar = "dpi", type = int, default = 128, help = "Rendering resolution. Defaults to %(default)d dpi.")
+parser.add_argument("-d", "--texdir", metavar = "dirname", type = str, default = "tex", help = "Subdirectory in which rendered TeX files are placed. Defaults to %(default)s.")
+parser.add_argument("--no-git", action = "store_true", help = "Do not bother with detecting Git and adding new files/removing unused ones.")
+parser.add_argument("-v", "--verbose", action = "count", default = 0, help = "Increases verbosity. Can be specified multiple times to increase.")
+parser.add_argument("htmlfile", metavar = "htmlfile", type = str, help = "HTML filename in which to detect/render/replace the images.")
+args = parser.parse_args(sys.argv[1:])
+
+class Replacer():
+	_TEX_REGEX = re.compile(r"<img src=\"(?P<src>[^\"]+)\" alt=\"latex:(?P<formula>[^\"]+)\"")
+	_FILENAME_REGEX = re.compile(r"[a-f0-9]{32}\.png")
+
+	def __init__(self, args):
+		self._args = args
+		self._included = set()
+		template_dir = os.path.realpath(os.path.dirname(__file__)) + "/template/"
+		with open(template_dir + "header.tex") as f:
+			self._latex_header = f.read()
+		with open(template_dir + "footer.tex") as f:
+			self._latex_footer = f.read()
+
+	def _have_git(self):
+		try:
+			subprocess.check_call([ "git", "status" ], stderr = subprocess.DEVNULL, stdout = subprocess.DEVNULL)
+			return True
+		except subprocess.CalledProcessError:
+			return False
+
+	def _render_formula(self, formula, output_filename):
+		if os.path.isfile(output_filename):
+			return
+
+		if self._args.verbose >= 1:
+			print("%s -> %s" % (formula, output_filename))
+		with tempfile.NamedTemporaryFile(mode = "w", prefix = "htmltex_", suffix = ".tex") as texfile, tempfile.TemporaryDirectory(prefix = "htmltex_") as render_dir:
+			# Create TeX file
+			texfile.write(self._latex_header)
+			texfile.write(formula)
+			texfile.write(self._latex_footer)
+			texfile.flush()
+
+			# Render it to PDF
+			stdout = subprocess.DEVNULL if not (self._args.verbose >= 2) else None
+			subprocess.check_call([ "pdflatex", "-output-directory=%s" % (render_dir), "-jobname=rendered", texfile.name ], stdout = stdout, stderr = stdout)
+
+			# Render to PPM
+			subprocess.check_call([ "pdftoppm", "-r", str(self._args.resolution), "-gray", "-f", "1", "-l", "1", "%s/rendered.pdf" % (render_dir), "%s/rendered" % (render_dir) ])
+
+			# Finally convert to PNG
+			pnm_filename = "%s/rendered-1.pgm" % (render_dir)
+			subprocess.check_call([ "convert", pnm_filename, "-trim", "+repage", output_filename ])
+
+	def _replacer(self, match):
+		groupdict = match.groupdict()
+		expected_filename = self._expected_filename(groupdict["formula"])
+		present_filename = groupdict["src"]
+		self._render_formula(groupdict["formula"], expected_filename)
+		self._included.add(os.path.basename(expected_filename))
+		return "<img src=\"%s\" alt=\"latex:%s\"" % (expected_filename, groupdict["formula"])
+
+	def _expected_filename(self, formula):
+		hashval = hashlib.md5(formula.encode()).hexdigest()
+		filename = self._args.texdir + "/" + hashval + ".png"
+		return filename
+
+	def _add_remove_git(self):
+		for filename in os.listdir(self._args.texdir):
+			if self._FILENAME_REGEX.fullmatch(filename):
+				# This is a applicable file
+				full_filename = self._args.texdir + "/" + filename
+				if filename in self._included:
+					subprocess.check_call([ "git", "add", full_filename ])
+				else:
+					os.unlink(full_filename)
+
+	def run(self):
+		with contextlib.suppress(FileExistsError):
+			os.makedirs(self._args.texdir)
+		with open(self._args.htmlfile) as f:
+			html_file = f.read()
+
+		new_html_file = self._TEX_REGEX.sub(self._replacer, html_file)
+
+		if (not self._args.no_git) and (self._have_git):
+			self._add_remove_git()
+
+replacer = Replacer(args)
+replacer.run()
