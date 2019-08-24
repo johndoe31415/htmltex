@@ -110,6 +110,9 @@ class Replacer():
 			html_file = f.read()
 
 		new_html_file = self._TEX_REGEX.sub(self._replacer, html_file)
+		if new_html_file != html_file:
+			with open(self._args.htmlfile, "w") as f:
+				f.write(new_html_file)
 
 		if (not self._args.no_git) and (self._have_git):
 			self._add_remove_git()
